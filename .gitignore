@@ -61,6 +61,13 @@ dlldata.c
 BenchmarkDotNet.Artifacts/
 
 # .NET
+.dotnet/
+.nuget/
+.local/
+.keys/
+motion-runs/
+obsbot-dev-server*.log
+*.err.log
 project.lock.json
 project.fragment.lock.json
 artifacts/

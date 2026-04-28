@@ -1,0 +1,802 @@
+@page "/"
+@page "/obsbot"
+@rendermode InteractiveServer
+@implements IDisposable
+@inject IObsbotCameraDriver Driver
+@inject FfmpegCameraStreamService StreamService
+@inject IJSRuntime Js
+
+<PageTitle>OBSBOT Lab</PageTitle>
+
+<div class="obsbot-lab">
+    <header class="lab-header">
+        <div>
+            <p class="eyebrow">Direct-control investigation</p>
+            <h1>OBSBOT Tiny SE Lab</h1>
+        </div>
+        <div class="header-actions">
+            <button class="btn btn-primary" @onclick="ConnectAsync" disabled="@_busy">Connect</button>
+            <button class="btn btn-outline-secondary" @onclick="RefreshAsync" disabled="@_busy">Refresh</button>
+            <button class="btn btn-outline-danger" @onclick="StopAsync">Stop</button>
+        </div>
+    </header>
+
+    <section class="status-strip" aria-label="Camera host status">
+        <div><span class="label">Device</span><strong>@(_state.Device?.DisplayName ?? "Not connected")</strong></div>
+        <div><span class="label">VID/PID</span><strong>@DeviceVidPid</strong></div>
+        <div><span class="label">Updated</span><strong>@UpdatedAge</strong></div>
+        <div><span class="label">Stream</span><strong>@StreamModeLabel</strong></div>
+    </section>
+
+    @if (!string.IsNullOrWhiteSpace(_state.LastError))
+    {
+        <div class="alert alert-warning">@_state.LastError</div>
+    }
+
+    <div class="lab-grid">
+        <section class="panel video-panel">
+            <div class="panel-title"><h2>Host Feed</h2><span>@ClickAimStatus</span></div>
+            <div class="feed-layout">
+                <div class="feed-main">
+                    <div class="@VideoShellClass" @ref="_videoShell" @onclick="OnVideoClick">
+                        <img class="host-stream active" src="@StreamUrl" alt="OBSBOT Tiny SE server stream" />
+                        <div class="stream-overlay">
+                            <strong>@_previewStatus</strong>
+                        </div>
+                        <span class="center-reticle" aria-hidden="true"></span>
+                        @if (_lastClick is not null)
+                        {
+                            <span class="aim-dot" style="@($"left: {_lastClick.Value.X * 100:0.###}%; top: {_lastClick.Value.Y * 100:0.###}%; --aim-start-left: {_lastClick.Value.X * 100:0.###}%; --aim-start-top: {_lastClick.Value.Y * 100:0.###}%;")"></span>
+                        }
+                    </div>
+                    <div class="button-row stream-actions">
+                        <button class="btn btn-outline-secondary" title="Reconnects the browser image element to the server-side MJPEG stream." @onclick="ReloadServerStream">Reload Stream</button>
+                        <label class="inline-select" title="Rotates the server stream before it reaches the browser. Vertical left is default for the current camera mount.">
+                            Orientation
+                            <select class="form-control" @bind="_streamOrientation" @bind:after="ReloadServerStream">
+                                <option value="vertical-left">Vertical left</option>
+                                <option value="vertical-right">Vertical right</option>
+                                <option value="horizontal">Horizontal</option>
+                            </select>
+                        </label>
+                    </div>
+                </div>
+                <aside class="feed-state" aria-label="Live camera state">
+                    <div class="panel-title"><h2>Live State</h2><span>@(_state.IsConnected ? "connected" : "offline")</span></div>
+                    <div class="state-grid">
+                        @foreach (var kind in _controlKinds)
+                        {
+                            var reading = GetReading(kind);
+                            <div class="state-row" title="@FormatRange(reading?.Range)">
+                                <span>@kind</span>
+                                <strong>@FormatReading(reading)</strong>
+                                <small>@FormatCompactRange(reading?.Range)</small>
+                            </div>
+                        }
+                    </div>
+                </aside>
+            </div>
+        </section>
+
+        <details class="panel urdf-panel">
+            <summary class="panel-summary">
+                <span>Pose Preview</span>
+                <small>@(_state.IsConnected ? "live joints" : "optional")</small>
+            </summary>
+            <svg class="urdf-viewport" viewBox="0 0 640 360" role="img" aria-label="OBSBOT pan tilt URDF state viewer">
+                <defs>
+                    <marker id="urdf-arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+                        <path d="M 0 0 L 10 5 L 0 10 z"></path>
+                    </marker>
+                    <linearGradient id="urdf-optical-gradient" x1="0" y1="0" x2="0" y2="1">
+                        <stop offset="0" stop-color="#12b76a" stop-opacity="0.55" />
+                        <stop offset="1" stop-color="#12b76a" stop-opacity="0.06" />
+                    </linearGradient>
+                </defs>
+
+                <rect class="urdf-bg" x="0" y="0" width="640" height="360" rx="12"></rect>
+                <g class="urdf-grid-lines">
+                    @for (var x = 24; x < 640; x += 24)
+                    {
+                        <line x1="@x" y1="0" x2="@x" y2="360"></line>
+                    }
+                    @for (var y = 24; y < 360; y += 24)
+                    {
+                        <line x1="0" y1="@y" x2="640" y2="@y"></line>
+                    }
+                </g>
+
+                <text class="urdf-view-title" x="24" y="34">top view: pan_joint</text>
+                <text class="urdf-view-title" x="420" y="34">side view: tilt_joint</text>
+
+                <g class="urdf-top-view">
+                    <circle class="urdf-limit-ring" cx="210" cy="168" r="118"></circle>
+                    <circle class="urdf-limit-ring minor" cx="210" cy="168" r="78"></circle>
+                    <line class="urdf-axis-line x" x1="92" y1="168" x2="328" y2="168"></line>
+                    <line class="urdf-axis-line y" x1="210" y1="50" x2="210" y2="286"></line>
+                    <text class="urdf-axis-label" x="332" y="172">+X</text>
+                    <text class="urdf-axis-label" x="216" y="54">+Y</text>
+                    <g transform="@UrdfPanTransform">
+                        <path class="urdf-fov" d="@UrdfTopFovPath"></path>
+                        <line class="urdf-optical-axis" x1="210" y1="168" x2="210" y2="@UrdfTopRayEndY" marker-end="url(#urdf-arrow)"></line>
+                        <rect class="urdf-base-shape" x="166" y="145" width="88" height="46" rx="8"></rect>
+                        <rect class="urdf-camera-shape" x="183" y="102" width="54" height="54" rx="9"></rect>
+                        <circle class="urdf-lens-shape" cx="210" cy="96" r="11"></circle>
+                        <text class="urdf-link-label" x="210" y="173">base_link</text>
+                        <text class="urdf-link-label" x="210" y="132">camera_link</text>
+                    </g>
+                    <circle class="urdf-joint-dot" cx="210" cy="168" r="5"></circle>
+                </g>
+
+                <g class="urdf-side-view">
+                    <line class="urdf-horizon" x1="410" y1="218" x2="610" y2="218"></line>
+                    <line class="urdf-axis-line z" x1="500" y1="300" x2="500" y2="86"></line>
+                    <text class="urdf-axis-label" x="506" y="92">+Z</text>
+                    <rect class="urdf-base-shape side" x="454" y="232" width="92" height="32" rx="8"></rect>
+                    <circle class="urdf-limit-ring side" cx="500" cy="218" r="70"></circle>
+                    <g transform="@UrdfTiltTransform">
+                        <line class="urdf-optical-axis side" x1="500" y1="218" x2="@UrdfSideRayEndX" y2="218" marker-end="url(#urdf-arrow)"></line>
+                        <rect class="urdf-camera-shape side" x="482" y="184" width="68" height="44" rx="8"></rect>
+                        <circle class="urdf-lens-shape side" cx="552" cy="206" r="10"></circle>
+                    </g>
+                    <circle class="urdf-joint-dot" cx="500" cy="218" r="5"></circle>
+                </g>
+            </svg>
+            <div class="urdf-readout">
+                <div><span>pan_joint</span><strong>@FormatDegrees(UrdfPanDegrees)</strong></div>
+                <div><span>tilt_joint</span><strong>@FormatDegrees(UrdfTiltDegrees)</strong></div>
+                <div><span>camera_zoom</span><strong>@FormatReading(GetReading(CameraControlKind.Zoom))</strong></div>
+            </div>
+            <code class="urdf-snippet">@UrdfJointSnippet</code>
+        </details>
+
+        <section class="panel controls-panel">
+            <div class="panel-title"><h2>Direct Controls</h2><span>standard UVC</span></div>
+            <div class="control-cluster">
+                <button class="btn btn-outline-secondary" title="Move up by the Tilt step using the selected motion profile." @onclick="() => MoveRelativeWithProfileAsync(0, _tiltStep)">Up</button>
+                <div>
+                    <button class="btn btn-outline-secondary" title="Move left by the Pan step using the selected motion profile." @onclick="() => MoveRelativeWithProfileAsync(_panStep, 0)">Left</button>
+                    <button class="btn btn-outline-secondary" title="Move right by the Pan step using the selected motion profile." @onclick="() => MoveRelativeWithProfileAsync(-_panStep, 0)">Right</button>
+                </div>
+                <button class="btn btn-outline-secondary" title="Move down by the Tilt step using the selected motion profile." @onclick="() => MoveRelativeWithProfileAsync(0, -_tiltStep)">Down</button>
+            </div>
+            <label title="Relative pan amount added to the current pan value when using Left or Right.">Pan step <input class="form-control" type="number" @bind="_panStep" /></label>
+            <label title="Relative tilt amount added to the current tilt value when using Up or Down.">Tilt step <input class="form-control" type="number" @bind="_tiltStep" /></label>
+            <div class="compact-field-row">
+                <label title="Absolute zoom value sent through the standard UVC zoom control.">Zoom <input class="form-control" type="number" @bind="_zoomTarget" /></label>
+                <button class="btn btn-primary" title="Send the Zoom target value to the camera." @onclick="SetZoomAsync">Set</button>
+            </div>
+        </section>
+
+        <section class="panel aiming-panel">
+            <div class="panel-title"><h2>Target Control</h2><span>@CalibrationConfidence</span></div>
+            <label title="Movement profile used by Move With Profile, arrow buttons, teachpoint chips, and routines.">
+                Profile
+                <select class="form-control" @bind="_selectedProfileName">
+                    @foreach (var profile in MotionProfiles)
+                    {
+                        <option value="@profile.Name">@profile.Name</option>
+                    }
+                </select>
+            </label>
+            <label class="toggle-row" title="When enabled, clicking the video moves the camera so the clicked image point should move toward the center reticle. Uses calibration when valid, otherwise uses a FOV-based center correction.">
+                <input type="checkbox" @bind="_clickToAimEnabled" />
+                <span>Enable click-to-center</span>
+            </label>
+            <label title="Name used when saving the current camera state as a teachpoint. Existing teachpoints with the same name are replaced.">Target name <input class="form-control" @bind="_targetName" /></label>
+            <div class="target-fields">
+                <label title="Absolute pan target. Values come from the Live State panel or saved teachpoints.">Pan <input class="form-control" type="number" @bind="_targetPan" /></label>
+                <label title="Absolute tilt target. Values come from the Live State panel or saved teachpoints.">Tilt <input class="form-control" type="number" @bind="_targetTilt" /></label>
+                <label title="Optional absolute zoom target. Leave blank to keep current zoom during a move.">Zoom <input class="form-control" type="number" @bind="_targetZoom" /></label>
+            </div>
+            <div class="button-row">
+                <button class="btn btn-primary" title="Move to the Pan/Tilt/Zoom target using the selected profile and live-state feedback." @onclick="MoveNumericWithProfileAsync">Move</button>
+                <button class="btn btn-outline-secondary" title="Send one raw absolute UVC command without the profile settling loop. Useful for comparing firmware behavior." @onclick="AimNumericAsync">Direct</button>
+                <button class="btn btn-outline-secondary" title="Save the current live pan, tilt, and zoom under Target name." @onclick="AddTeachPointAsync">Add Teachpoint</button>
+            </div>
+            <div class="saved-list">
+                @foreach (var target in _teachPoints)
+                {
+                    <button class="target-chip" title="@($"Move to {target.Name}: pan {target.Pan}, tilt {target.Tilt}, zoom {target.Zoom?.ToString() ?? "unchanged"}.")" @onclick="() => MoveTeachPointAsync(target)">@target.Name</button>
+                }
+            </div>
+            @if (_lastMotionRun is not null)
+            {
+                <div class="motion-result @(_lastMotionRun.Success ? "success" : "warning")">
+                    <strong>@_lastMotionRun.Name</strong>
+                    <span>@_lastMotionRun.DurationMilliseconds.ToString("0") ms, final @FormatPair(_lastMotionRun.FinalPan, _lastMotionRun.FinalTilt), error @_lastMotionRun.FinalPanError/@_lastMotionRun.FinalTiltError</span>
+                </div>
+            }
+            @if (!string.IsNullOrWhiteSpace(_clickAimMessage))
+            {
+                <p class="inline-status">@_clickAimMessage</p>
+            }
+        </section>
+
+        <section class="panel calibration-panel">
+            <div class="panel-title"><h2>Click Calibration</h2><span>@CalibrationConfidence</span></div>
+            <label>Sample name <input class="form-control" @bind="_calibrationName" /></label>
+            <p class="muted">@CalibrationDetail</p>
+            <button class="btn btn-outline-secondary" title="Stores the last clicked image point with the current live pan and tilt. Move the camera between samples for calibration to become usable." @onclick="RecordCalibrationAsync">Record Last Click</button>
+            <div class="sample-list">
+                @foreach (var sample in Driver.CalibrationSamples.TakeLast(5).Reverse())
+                {
+                    <div><strong>@sample.Name</strong><span>@sample.ImageX.ToString("0.000"), @sample.ImageY.ToString("0.000") -> @sample.Pan, @sample.Tilt</span></div>
+                }
+            </div>
+        </section>
+
+        <section class="panel routine-panel">
+            <div class="panel-title"><h2>Teachpoint Runner</h2><span>@_motionRuns.Count motion run(s)</span></div>
+            <p class="muted">Runs saved teachpoints in sequence. Rate Test repeats moves to measure latency and stability.</p>
+            <label>Dwell ms <input class="form-control" type="number" @bind="_routineDwellMs" /></label>
+            <div class="button-row">
+                <button class="btn btn-outline-secondary" @onclick="RunRoutineAsync">Run Teachpoints</button>
+                <button class="btn btn-outline-secondary" @onclick="RunRateTestAsync">Rate Test</button>
+            </div>
+            <div class="command-list">
+                @foreach (var run in _motionRuns.Take(6))
+                {
+                    <div><strong>@run.Name</strong><span>@run.Profile.Name - @(run.Success ? "ok" : "failed") - @run.DurationMilliseconds.ToString("0.0") ms - error @run.FinalPanError/@run.FinalTiltError</span></div>
+                }
+                @foreach (var command in Driver.CommandHistory.Take(4))
+                {
+                    <div><strong>@command.CommandName</strong><span>@command.ElapsedMilliseconds.ToString("0.0") ms - @command.Message</span></div>
+                }
+            </div>
+        </section>
+
+        <details class="panel probe-panel">
+            <summary class="panel-summary">
+                <span>Driver Discovery</span>
+                <small>advanced</small>
+            </summary>
+            <p class="muted">Reverse-engineering tools. Use this only when looking for extra UVC or Kernel Streaming controls beyond normal pan, tilt, zoom, and teachpoint movement.</p>
+            <div class="button-row">
+                <button class="btn btn-outline-secondary" @onclick="ProbeAsync">Probe Controls</button>
+            </div>
+            <InputFile OnChange="AnalyzeCaptureAsync" />
+            @if (_probeReport is not null)
+            {
+                <div class="probe-output">
+                    @foreach (var status in _probeReport.CaptureToolStatus)
+                    {
+                        <div>@status</div>
+                    }
+                    @foreach (var note in _probeReport.Notes)
+                    {
+                        <div>@note</div>
+                    }
+                </div>
+            }
+            @if (_captureSummary is not null)
+            {
+                <div class="probe-output">
+                    <strong>@_captureSummary.FileName</strong>
+                    <div>@_captureSummary.Bytes bytes</div>
+                    <div>@_captureSummary.CandidateControlTransfers candidate transfer pattern(s)</div>
+                </div>
+            }
+        </details>
+
+        <section class="panel log-panel">
+            <div class="panel-title"><h2>Driver Log</h2><span>tail</span></div>
+            <div class="log-list">
+                @foreach (var entry in Driver.Logs.Take(80))
+                {
+                    <div class="log-entry @entry.Level.ToString().ToLowerInvariant()">
+                        <time>@entry.TimestampUtc.ToLocalTime().ToString("HH:mm:ss.fff")</time>
+                        <strong>@entry.Source</strong>
+                        <span>@entry.Message</span>
+                        @if (!string.IsNullOrWhiteSpace(entry.Raw))
+                        {
+                            <code>@entry.Raw</code>
+                        }
+                    </div>
+                }
+            </div>
+        </section>
+    </div>
+</div>
+
+@code {
+    private readonly CameraControlKind[] _controlKinds = [CameraControlKind.Pan, CameraControlKind.Tilt, CameraControlKind.Zoom, CameraControlKind.Focus, CameraControlKind.Exposure];
+    private static readonly MotionProfile[] MotionProfiles =
+    [
+        new(
+            "single_firmware",
+            Tolerance: 5,
+            ControlMode: MotionControlMode.AbsoluteSingleShot,
+            StableSamples: 2,
+            NoProgressSamples: 40,
+            SampleInterval: TimeSpan.FromMilliseconds(30),
+            Timeout: TimeSpan.FromMilliseconds(8000)),
+        new(
+            "setpoint_glide",
+            MinPanSpeed: 2,
+            MaxPanSpeed: 8,
+            MinTiltSpeed: 2,
+            MaxTiltSpeed: 7,
+            Tolerance: 5,
+            SlowZone: 24,
+            MaxPanStepChange: 3,
+            MaxTiltStepChange: 3,
+            StableSamples: 2,
+            NoProgressSamples: 14,
+            SampleInterval: TimeSpan.FromMilliseconds(35),
+            Timeout: TimeSpan.FromMilliseconds(8000)),
+        new(
+            "setpoint_fast",
+            MinPanSpeed: 4,
+            MaxPanSpeed: 16,
+            MinTiltSpeed: 3,
+            MaxTiltSpeed: 13,
+            Tolerance: 6,
+            SlowZone: 32,
+            MaxPanStepChange: 4,
+            MaxTiltStepChange: 4,
+            StableSamples: 2,
+            NoProgressSamples: 20,
+            SampleInterval: TimeSpan.FromMilliseconds(25),
+            Timeout: TimeSpan.FromMilliseconds(8000)),
+        new(
+            "setpoint_limit",
+            MinPanSpeed: 10,
+            MaxPanSpeed: 28,
+            MinTiltSpeed: 6,
+            MaxTiltSpeed: 20,
+            Tolerance: 8,
+            SlowZone: 55,
+            MaxPanStepChange: 8,
+            MaxTiltStepChange: 7,
+            StableSamples: 2,
+            NoProgressSamples: 24,
+            SampleInterval: TimeSpan.FromMilliseconds(18),
+            Timeout: TimeSpan.FromMilliseconds(8000)),
+        new(
+            "setpoint_overdrive",
+            MinPanSpeed: 14,
+            MaxPanSpeed: 42,
+            MinTiltSpeed: 10,
+            MaxTiltSpeed: 30,
+            Tolerance: 10,
+            SlowZone: 70,
+            MaxPanStepChange: 12,
+            MaxTiltStepChange: 10,
+            StableSamples: 2,
+            NoProgressSamples: 28,
+            SampleInterval: TimeSpan.FromMilliseconds(15),
+            Timeout: TimeSpan.FromMilliseconds(8000))
+    ];
+
+    private readonly List<TeachPoint> _teachPoints = [];
+    private readonly List<MotionRun> _motionRuns = [];
+    private ObsbotCameraState _state = ObsbotCameraState.Disconnected;
+    private (double X, double Y)? _lastClick;
+    private bool _busy;
+    private bool _clickToAimEnabled;
+    private int _panStep = 25;
+    private int _tiltStep = 25;
+    private int _zoomTarget;
+    private string _targetName = "Target 1";
+    private int? _targetPan;
+    private int? _targetTilt;
+    private int? _targetZoom;
+    private string _selectedProfileName = "setpoint_limit";
+    private MotionRun? _lastMotionRun;
+    private string _calibrationName = "Sample 1";
+    private int _routineDwellMs = 250;
+    private ProtocolProbeReport? _probeReport;
+    private CaptureAnalysisSummary? _captureSummary;
+    private ElementReference _videoShell;
+    private string _streamCommand = string.Empty;
+    private string _streamBackend = "opencv";
+    private string _streamOrientation = "vertical-left";
+    private int _streamVersion = 1;
+    private string _previewStatus = "Server stream selected.";
+    private string _clickAimMessage = string.Empty;
+    private int _clickMarkerId;
+
+    private string DeviceVidPid => _state.Device is null ? "unknown" : $"{_state.Device.VendorId ?? "????"}:{_state.Device.ProductId ?? "????"}";
+    private string CalibrationConfidence => Driver.CalibrationSamples.Count switch { 0 => "center correction", 1 => "one sample", _ => "samples stored" };
+    private string CalibrationDetail => Driver.CalibrationSamples.Count > 0
+        ? "Calibration samples are stored for later model fitting. Click-to-center currently uses the visible rotated image offset so stale samples cannot override the control."
+        : "Click-to-center moves the camera from the visible offset of the clicked point. Click above the reticle changes tilt; click beside it changes pan.";
+    private string ClickAimStatus => _clickToAimEnabled ? $"click-to-center {CalibrationConfidence}" : "click-to-center off";
+    private string UpdatedAge => _state.LastUpdatedUtc == default ? "never" : (DateTimeOffset.UtcNow - _state.LastUpdatedUtc).TotalSeconds < 2 ? "now" : $"{(DateTimeOffset.UtcNow - _state.LastUpdatedUtc).TotalSeconds:0}s ago";
+    private string StreamModeLabel => $"{(StreamService.ShouldUseFfmpeg(_streamBackend) ? "FFmpeg DirectShow" : "OpenCV DirectShow")}, {StreamService.OrientationLabel(_streamOrientation)}";
+    private string StreamUrl => $"/obsbot/video.mjpeg?backend={Uri.EscapeDataString(_streamBackend)}&orientation={Uri.EscapeDataString(_streamOrientation)}&v={_streamVersion}";
+    private string VideoShellClass => _streamOrientation.StartsWith("vertical", StringComparison.OrdinalIgnoreCase) ? "video-shell portrait" : "video-shell";
+    private MotionProfile SelectedProfile => MotionProfiles.FirstOrDefault(profile => profile.Name == _selectedProfileName) ?? MotionProfiles[0];
+    private double UrdfPanDegrees => GetReading(CameraControlKind.Pan)?.Value ?? 0;
+    private double UrdfTiltDegrees => GetReading(CameraControlKind.Tilt)?.Value ?? 0;
+    private double UrdfZoomScale => Math.Clamp(1 + ((GetReading(CameraControlKind.Zoom)?.Value ?? 0) / 12.0), 1, 1.8);
+    private double UrdfTopRayLength => Math.Clamp(108 * UrdfZoomScale, 104, 164);
+    private double UrdfTopRayEndY => 168 - UrdfTopRayLength;
+    private double UrdfFovHalfWidth => Math.Clamp(62 / UrdfZoomScale, 34, 62);
+    private double UrdfFovEndY => 168 - (UrdfTopRayLength * 0.78);
+    private double UrdfSideRayEndX => 500 + Math.Clamp(92 * UrdfZoomScale, 92, 152);
+    private string UrdfPanTransform => $"rotate({UrdfPanDegrees:0.###} 210 168)";
+    private string UrdfTiltTransform => $"rotate({-UrdfTiltDegrees:0.###} 500 218)";
+    private string UrdfTopFovPath => $"M 210 168 L {210 - UrdfFovHalfWidth:0.###} {UrdfFovEndY:0.###} L {210 + UrdfFovHalfWidth:0.###} {UrdfFovEndY:0.###} Z";
+    private string UrdfJointSnippet => $"<joint name=\"pan_joint\" type=\"revolute\" value=\"{UrdfPanDegrees:0.###}deg\" />\n<joint name=\"tilt_joint\" type=\"revolute\" value=\"{UrdfTiltDegrees:0.###}deg\" />";
+    private ClickCalibrationModel CalibrationModel => BuildCalibrationModel(Driver.CalibrationSamples);
+
+    protected override void OnInitialized()
+    {
+        _state = Driver.State;
+        _streamCommand = StreamService.DescribeActiveStream();
+        _streamBackend = StreamService.ShouldUseFfmpeg(null) ? "ffmpeg" : "opencv";
+        _streamOrientation = StreamService.ActiveOrientation;
+        _previewStatus = $"Server stream selected: {StreamModeLabel}.";
+        Driver.StateChanged += OnStateChanged;
+        Driver.LogAdded += OnLogAdded;
+        Driver.CommandCompleted += OnCommandCompleted;
+    }
+
+    public void Dispose()
+    {
+        Driver.StateChanged -= OnStateChanged;
+        Driver.LogAdded -= OnLogAdded;
+        Driver.CommandCompleted -= OnCommandCompleted;
+    }
+
+    private async Task ConnectAsync() => await RunBusyAsync(async () =>
+    {
+        await Driver.ConnectAsync();
+        _state = Driver.State;
+        PrimeTargetsFromState();
+    });
+
+    private async Task RefreshAsync() => await RunBusyAsync(async () =>
+    {
+        _state = await Driver.RefreshStateAsync();
+        PrimeTargetsFromState();
+    });
+
+    private async Task StopAsync() => await Driver.StopAsync();
+    private async Task MoveRelativeWithProfileAsync(int panDelta, int tiltDelta)
+    {
+        var currentPan = GetReading(CameraControlKind.Pan)?.Value;
+        var currentTilt = GetReading(CameraControlKind.Tilt)?.Value;
+        if (currentPan is not int pan || currentTilt is not int tilt)
+        {
+            return;
+        }
+
+        await MoveTeachPointAsync(new TeachPoint(
+            $"Relative {panDelta:+#;-#;0}/{tiltDelta:+#;-#;0}",
+            pan + panDelta,
+            tilt + tiltDelta,
+            GetReading(CameraControlKind.Zoom)?.Value));
+    }
+
+    private async Task SetZoomAsync() => await RunBusyAsync(() => Driver.SetZoomAsync(_zoomTarget));
+
+    private async Task AimNumericAsync()
+    {
+        var target = new AimTarget(string.IsNullOrWhiteSpace(_targetName) ? "Numeric target" : _targetName, _targetPan, _targetTilt, _targetZoom);
+        await AimTargetAsync(target);
+    }
+
+    private async Task AimTargetAsync(AimTarget target) => await RunBusyAsync(() => Driver.AimAtAsync(target));
+
+    private async Task MoveNumericWithProfileAsync()
+    {
+        if (_targetPan is null || _targetTilt is null)
+        {
+            return;
+        }
+
+        var target = new TeachPoint(
+            string.IsNullOrWhiteSpace(_targetName) ? "Numeric target" : _targetName.Trim(),
+            _targetPan.Value,
+            _targetTilt.Value,
+            _targetZoom);
+        await MoveTeachPointAsync(target);
+    }
+
+    private async Task AddTeachPointAsync()
+    {
+        await RunBusyAsync(async () =>
+        {
+            var controller = new TeachPointMotionController(Driver);
+            var target = await controller.CaptureTeachPointAsync(string.IsNullOrWhiteSpace(_targetName) ? $"Target {_teachPoints.Count + 1}" : _targetName);
+            _teachPoints.RemoveAll(existing => string.Equals(existing.Name, target.Name, StringComparison.OrdinalIgnoreCase));
+            _teachPoints.Add(target);
+            _targetName = $"Target {_teachPoints.Count + 1}";
+            _targetPan = target.Pan;
+            _targetTilt = target.Tilt;
+            _targetZoom = target.Zoom;
+        });
+    }
+
+    private async Task MoveTeachPointAsync(TeachPoint target)
+    {
+        await RunBusyAsync(async () =>
+        {
+            var controller = new TeachPointMotionController(Driver);
+            var run = await controller.MoveToAsync(target, SelectedProfile);
+            _lastMotionRun = run;
+            _motionRuns.Insert(0, run);
+            if (_motionRuns.Count > 100)
+            {
+                _motionRuns.RemoveRange(100, _motionRuns.Count - 100);
+            }
+
+            _targetName = target.Name;
+            _targetPan = target.Pan;
+            _targetTilt = target.Tilt;
+            _targetZoom = target.Zoom;
+            _state = await Driver.RefreshStateAsync();
+        });
+    }
+
+    private async Task RecordCalibrationAsync()
+    {
+        if (_lastClick is null)
+        {
+            _clickAimMessage = "Click the video first, then record the sample.";
+            return;
+        }
+
+        await RunBusyAsync(async () =>
+        {
+            await Driver.RecordCalibrationSampleAsync(_calibrationName, _lastClick.Value.X, _lastClick.Value.Y);
+            _calibrationName = $"Sample {Driver.CalibrationSamples.Count + 1}";
+            _clickAimMessage = CalibrationModel.IsValid
+                ? "Calibration sample recorded. Click-to-aim can use calibrated mapping."
+                : "Sample recorded. Add samples from different camera positions to calibrate.";
+        });
+    }
+
+    private async Task RunRoutineAsync()
+    {
+        var targets = _teachPoints.ToArray();
+        if (targets.Length > 0)
+        {
+            await RunBusyAsync(async () =>
+            {
+                var controller = new TeachPointMotionController(Driver);
+                foreach (var target in targets)
+                {
+                    var run = await controller.MoveToAsync(target, SelectedProfile);
+                    _lastMotionRun = run;
+                    _motionRuns.Insert(0, run);
+                    await InvokeAsync(StateHasChanged);
+                    await Task.Delay(Math.Max(0, _routineDwellMs));
+                }
+
+                if (_motionRuns.Count > 100)
+                {
+                    _motionRuns.RemoveRange(100, _motionRuns.Count - 100);
+                }
+            });
+        }
+    }
+
+    private async Task RunRateTestAsync()
+    {
+        var pan = _targetPan ?? GetReading(CameraControlKind.Pan)?.Value ?? 0;
+        var tilt = _targetTilt ?? GetReading(CameraControlKind.Tilt)?.Value ?? 0;
+        var targets = Enumerable.Range(0, 8)
+            .Select(index => new TeachPoint($"Rate {index + 1}", pan + (index % 2 == 0 ? _panStep : -_panStep), tilt, _targetZoom))
+            .ToArray();
+        await RunBusyAsync(async () =>
+        {
+            var controller = new TeachPointMotionController(Driver);
+            foreach (var target in targets)
+            {
+                var run = await controller.MoveToAsync(target, SelectedProfile);
+                _lastMotionRun = run;
+                _motionRuns.Insert(0, run);
+            }
+
+            if (_motionRuns.Count > 100)
+            {
+                _motionRuns.RemoveRange(100, _motionRuns.Count - 100);
+            }
+        });
+    }
+
+    private async Task ProbeAsync() => await RunBusyAsync(async () => _probeReport = await Driver.ProbeProtocolAsync());
+
+    private async Task AnalyzeCaptureAsync(InputFileChangeEventArgs args)
+    {
+        var file = args.File;
+        await using var stream = file.OpenReadStream(maxAllowedSize: 50 * 1024 * 1024);
+        _captureSummary = await Driver.AnalyzeCaptureAsync(file.Name, stream);
+    }
+
+    private void ReloadServerStream()
+    {
+        _streamVersion++;
+        _previewStatus = $"Server stream selected: {StreamModeLabel}.";
+    }
+
+    private async Task OnVideoClick(MouseEventArgs args)
+    {
+        var point = await Js.InvokeAsync<NormalizedClickPoint>("obsbotLab.getClickPoint", _videoShell, args.ClientX, args.ClientY);
+        var x = Math.Clamp(point.X, 0, 1);
+        var y = Math.Clamp(point.Y, 0, 1);
+        _lastClick = (x, y);
+        var markerId = ++_clickMarkerId;
+        _ = ClearClickMarkerAsync(markerId);
+
+        if (!point.InsideImage)
+        {
+            _clickAimMessage = point.Reason ?? "Click was outside the video frame.";
+            return;
+        }
+
+        if (_clickToAimEnabled && TryMapClickToAim(x, y, out var target) && target.Pan is int pan && target.Tilt is int tilt)
+        {
+            _clickAimMessage = $"Centering click: target pan {pan}, tilt {tilt} using {target.Name}.";
+            await MoveTeachPointAsync(new TeachPoint(target.Name, pan, tilt, target.Zoom));
+            return;
+        }
+
+        if (_clickToAimEnabled)
+        {
+            _clickAimMessage = "Click-to-center needs live pan and tilt before it can move.";
+        }
+    }
+
+    private bool TryMapClickToAim(double x, double y, out AimTarget target)
+    {
+        target = new AimTarget("Click target", ImageX: x, ImageY: y);
+
+        var currentPan = GetReading(CameraControlKind.Pan)?.Value;
+        var currentTilt = GetReading(CameraControlKind.Tilt)?.Value;
+        if (currentPan is null || currentTilt is null)
+        {
+            return false;
+        }
+
+        var zoom = GetReading(CameraControlKind.Zoom)?.Value ?? 0;
+        var zoomScale = 1 + (Math.Clamp(zoom, 0, 12) * 0.055);
+        var isPortrait = _streamOrientation.StartsWith("vertical", StringComparison.OrdinalIgnoreCase);
+        var horizontalFovDegrees = (isPortrait ? 44 : 78) / zoomScale;
+        var verticalFovDegrees = (isPortrait ? 78 : 44) / zoomScale;
+        var deadBand = 0.025;
+        var xOffset = Math.Abs(x - 0.5) < deadBand ? 0 : x - 0.5;
+        var yOffset = Math.Abs(y - 0.5) < deadBand ? 0 : y - 0.5;
+        var panCorrection = -xOffset * horizontalFovDegrees;
+        var tiltCorrection = -yOffset * verticalFovDegrees;
+        var pan = ClampToRange(CameraControlKind.Pan, (int)Math.Round(currentPan.Value + panCorrection));
+        var tilt = ClampToRange(CameraControlKind.Tilt, (int)Math.Round(currentTilt.Value + tiltCorrection));
+        target = new AimTarget("click center", pan, tilt, _targetZoom, x, y);
+        return true;
+    }
+
+    private async Task ClearClickMarkerAsync(int markerId)
+    {
+        await Task.Delay(1000);
+        if (_clickMarkerId == markerId)
+        {
+            _lastClick = null;
+            await InvokeAsync(StateHasChanged);
+        }
+    }
+
+    private int ClampToRange(CameraControlKind kind, int value)
+    {
+        var range = GetReading(kind)?.Range;
+        return range is null ? value : Math.Clamp(value, range.Min, range.Max);
+    }
+
+    private async Task RunBusyAsync(Func<Task> action)
+    {
+        _busy = true;
+        try
+        {
+            await action();
+        }
+        finally
+        {
+            _busy = false;
+            await InvokeAsync(StateHasChanged);
+        }
+    }
+
+    private CameraControlReading? GetReading(CameraControlKind kind) => _state.Controls.TryGetValue(kind, out var reading) ? reading : null;
+
+    private void PrimeTargetsFromState()
+    {
+        _targetPan ??= GetReading(CameraControlKind.Pan)?.Value;
+        _targetTilt ??= GetReading(CameraControlKind.Tilt)?.Value;
+        _targetZoom ??= GetReading(CameraControlKind.Zoom)?.Value;
+        _zoomTarget = _targetZoom ?? _zoomTarget;
+    }
+
+    private static string FormatReading(CameraControlReading? reading) => reading?.Value?.ToString() ?? reading?.Error ?? "unknown";
+    private static string FormatDegrees(double value) => $"{value:0.###} deg";
+    private static string FormatPair(int? pan, int? tilt) => pan is null || tilt is null ? "unknown" : $"{pan},{tilt}";
+    private static string FormatRange(CameraControlRange? range) => range is null ? "no range" : $"{range.Min}..{range.Max}, step {range.Step}, default {range.Default}";
+    private static string FormatCompactRange(CameraControlRange? range) => range is null ? "no range" : $"{range.Min}..{range.Max}";
+    private void OnStateChanged(ObsbotCameraState state) { _state = state; _ = InvokeAsync(StateHasChanged); }
+    private void OnLogAdded(DriverLogEntry entry) => _ = InvokeAsync(StateHasChanged);
+    private void OnCommandCompleted(CameraCommandResult result) => _ = InvokeAsync(StateHasChanged);
+
+    private static ClickCalibrationModel BuildCalibrationModel(IReadOnlyList<CalibrationSample> samples)
+    {
+        if (samples.Count < 3)
+        {
+            return ClickCalibrationModel.Invalid;
+        }
+
+        var recent = samples.TakeLast(12).ToArray();
+        var xx = 0d;
+        var xy = 0d;
+        var yy = 0d;
+        var sx = 0d;
+        var sy = 0d;
+        var n = recent.Length;
+        foreach (var sample in recent)
+        {
+            sx += sample.ImageX;
+            sy += sample.ImageY;
+        }
+
+        var mx = sx / n;
+        var my = sy / n;
+        foreach (var sample in recent)
+        {
+            var dx = sample.ImageX - mx;
+            var dy = sample.ImageY - my;
+            xx += dx * dx;
+            xy += dx * dy;
+            yy += dy * dy;
+        }
+
+        var determinant = (xx * yy) - (xy * xy);
+        if (Math.Abs(determinant) < 0.0008)
+        {
+            return ClickCalibrationModel.Invalid;
+        }
+
+        var panFit = FitAffine(recent, sample => sample.Pan, mx, my, xx, xy, yy, determinant);
+        var tiltFit = FitAffine(recent, sample => sample.Tilt, mx, my, xx, xy, yy, determinant);
+        return new ClickCalibrationModel(true, panFit.A, panFit.X, panFit.Y, tiltFit.A, tiltFit.X, tiltFit.Y);
+    }
+
+    private static (double A, double X, double Y) FitAffine(
+        IReadOnlyList<CalibrationSample> samples,
+        Func<CalibrationSample, double> value,
+        double meanX,
+        double meanY,
+        double xx,
+        double xy,
+        double yy,
+        double determinant)
+    {
+        var meanValue = samples.Average(value);
+        var xv = 0d;
+        var yv = 0d;
+        foreach (var sample in samples)
+        {
+            var centeredValue = value(sample) - meanValue;
+            xv += (sample.ImageX - meanX) * centeredValue;
+            yv += (sample.ImageY - meanY) * centeredValue;
+        }
+
+        var slopeX = ((yy * xv) - (xy * yv)) / determinant;
+        var slopeY = ((xx * yv) - (xy * xv)) / determinant;
+        var intercept = meanValue - (slopeX * meanX) - (slopeY * meanY);
+        return (intercept, slopeX, slopeY);
+    }
+
+    private sealed record NormalizedClickPoint(double X, double Y, bool InsideImage, string? Reason);
+
+    private sealed record ClickCalibrationModel(
+        bool IsValid,
+        double PanA,
+        double PanX,
+        double PanY,
+        double TiltA,
+        double TiltX,
+        double TiltY)
+    {
+        public static ClickCalibrationModel Invalid { get; } = new(false, 0, 0, 0, 0, 0, 0);
+    }
+}
